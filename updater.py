@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""updater.py: check and update brew, cargo, go and ollama packages.
+"""updater.py: check and update brew, cargo, go, ollama, npm, pnpm and bun global packages.
 
 Usage:
   updater.py [-y] [--dry-run] [--only brew,cargo,go,ollama] [--include-casks] [--rollback]
@@ -30,7 +30,7 @@ LOG_DIR = Path.home() / ".local" / "state" / "updater"
 LOG_FILE = LOG_DIR / "updates.jsonl"
 OLLAMA_RELEASE_API = "https://api.github.com/repos/ollama/ollama/releases/latest"
 OLLAMA_INSTALL_CMD = "curl -fsSL https://ollama.com/install.sh | sh"
-SOURCES = ["brew", "cargo", "go", "ollama"]
+SOURCES = ["brew", "cargo", "go", "ollama", "npm", "pnpm", "bun"]
 
 
 @dataclass
@@ -423,7 +423,136 @@ class Ollama(Source):
         return self.installed()
 
 
-SOURCE_CLASSES = {"brew": Brew, "cargo": Cargo, "go": Go, "ollama": Ollama}
+def parse_json(out, default):
+    """Parse JSON from tool output, tolerating leading text such as pnpm's legend."""
+    text = out.strip()
+    for opener in ("{", "["):
+        i = text.find(opener)
+        if i != -1:
+            try:
+                return json.loads(text[i:])
+            except json.JSONDecodeError:
+                pass
+    return default
+
+
+class Npm(Source):
+    name = "npm"
+    tool = "npm"
+
+    def installed(self):
+        _, out, _ = run(["npm", "-g", "ls", "--json", "--depth=0"])
+        deps = parse_json(out, {}).get("dependencies", {})
+        return {k: v.get("version", "") for k, v in deps.items()}
+
+    def check(self, ctx):
+        _, out, _ = run(["npm", "-g", "outdated", "--json"], timeout=600)  # exit 1 = outdated found
+        pkgs = []
+        for name, info in parse_json(out, {}).items():
+            cur, latest = info.get("current"), info.get("latest")
+            if cur and latest and latest != cur:
+                pkgs.append(Pkg("npm", name, cur, latest))
+        return pkgs
+
+    def update(self, pkg):
+        cmd = ["npm", "install", "-g", f"{pkg.name}@latest"]
+        rc, out, err = run(cmd, timeout=1800)
+        return rc == 0, shlex.join(cmd), out + err
+
+    def installed_version(self, pkg):
+        return self.installed().get(pkg.name) or None
+
+    def rollback(self, entry):
+        cmd = ["npm", "install", "-g", f"{entry['package']}@{entry['old']}"]
+        rc, out, err = run(cmd, timeout=1800)
+        return rc == 0, shlex.join(cmd), out + err
+
+
+class Pnpm(Source):
+    name = "pnpm"
+    tool = "pnpm"
+
+    def installed(self):
+        _, out, _ = run(["pnpm", "-g", "ls", "--json", "--depth=0"])
+        result = {}
+        data = parse_json(out, [])
+        for root in data if isinstance(data, list) else []:
+            for k, v in root.get("dependencies", {}).items():
+                result[k] = v.get("version", "")
+        return result
+
+    def check(self, ctx):
+        _, out, _ = run(["pnpm", "-g", "outdated", "--format", "json"], timeout=600)
+        pkgs = []
+        for name, info in parse_json(out, {}).items():
+            cur, latest = info.get("current"), info.get("latest")
+            if cur and latest and latest != cur:
+                pkgs.append(Pkg("pnpm", name, cur, latest))
+        return pkgs
+
+    def update(self, pkg):
+        cmd = ["pnpm", "add", "-g", f"{pkg.name}@latest"]
+        rc, out, err = run(cmd, timeout=1800)
+        return rc == 0, shlex.join(cmd), out + err
+
+    def installed_version(self, pkg):
+        return self.installed().get(pkg.name) or None
+
+    def rollback(self, entry):
+        cmd = ["pnpm", "add", "-g", f"{entry['package']}@{entry['old']}"]
+        rc, out, err = run(cmd, timeout=1800)
+        return rc == 0, shlex.join(cmd), out + err
+
+
+class Bun(Source):
+    """Bun has no global 'outdated' command, so latest versions come from the npm registry."""
+    name = "bun"
+    tool = "bun"
+
+    def global_dir(self):
+        base = os.environ.get("BUN_INSTALL") or str(Path.home() / ".bun")
+        return Path(base) / "install" / "global"
+
+    def installed(self):
+        root = self.global_dir()
+        try:
+            deps = json.loads((root / "package.json").read_text(encoding="utf-8")).get("dependencies", {})
+        except (OSError, json.JSONDecodeError):
+            return {}
+        result = {}
+        for name in deps:
+            try:
+                meta = json.loads((root / "node_modules" / name / "package.json").read_text(encoding="utf-8"))
+                result[name] = meta.get("version", "")
+            except (OSError, json.JSONDecodeError):
+                result[name] = ""
+        return result
+
+    def check(self, ctx):
+        pkgs = []
+        for name, cur in self.installed().items():
+            rc, out, _ = run(["npm", "view", name, "version"], timeout=120)
+            latest = out.strip()
+            if rc == 0 and latest and cur and latest != cur:
+                pkgs.append(Pkg("bun", name, cur, latest))
+        return pkgs
+
+    def update(self, pkg):
+        cmd = ["bun", "add", "-g", f"{pkg.name}@latest"]
+        rc, out, err = run(cmd, timeout=1800)
+        return rc == 0, shlex.join(cmd), out + err
+
+    def installed_version(self, pkg):
+        return self.installed().get(pkg.name) or None
+
+    def rollback(self, entry):
+        cmd = ["bun", "add", "-g", f"{entry['package']}@{entry['old']}"]
+        rc, out, err = run(cmd, timeout=1800)
+        return rc == 0, shlex.join(cmd), out + err
+
+
+SOURCE_CLASSES = {"brew": Brew, "cargo": Cargo, "go": Go, "ollama": Ollama,
+                  "npm": Npm, "pnpm": Pnpm, "bun": Bun}
 
 
 # ---------------------------------------------------------------- apply / log entries
